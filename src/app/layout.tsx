@@ -3,8 +3,8 @@ import "./globals.css";
 import "./lib/envSetup";
 
 export const metadata: Metadata = {
-  title: "Realtime API Agents",
-  description: "A demo app from OpenAI.",
+  title: "NikaTech Solutions Voice Agents",
+  description: "NikaTech Solutions – multi-agent realtime voice assistant console.",
 };
 
 export default function RootLayout({
