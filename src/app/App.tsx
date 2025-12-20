@@ -22,24 +22,10 @@ import { createModerationGuardrail } from "@/app/agentConfigs/guardrails";
 
 // Agent configs
 import { allAgentSets, defaultAgentSetKey } from "@/app/agentConfigs";
-import {
-  customerServiceRetailScenario,
-  customerServiceRetailCompanyName,
-} from "@/app/agentConfigs/customerServiceRetail";
-import {
-  chatSupervisorScenario,
-  chatSupervisorCompanyName,
-} from "@/app/agentConfigs/chatSupervisor";
-import { simpleHandoffScenario } from "@/app/agentConfigs/simpleHandoff";
-import { nikaScenario, nikaCompanyName } from "./agentConfigs/nika";
+import { nikaCompanyName } from "@/app/agentConfigs/nika";
 
 // Map used by connect logic for scenarios defined via the SDK.
-const sdkScenarioMap: Record<string, RealtimeAgent[]> = {
-  simpleHandoff: simpleHandoffScenario,
-  customerServiceRetail: customerServiceRetailScenario,
-  chatSupervisor: chatSupervisorScenario,
-  nika: nikaScenario,
-};
+const sdkScenarioMap: Record<string, RealtimeAgent[]> = allAgentSets;
 
 import useAudioDownload from "./hooks/useAudioDownload";
 import { useHandleSessionHistory } from "./hooks/useHandleSessionHistory";
@@ -218,12 +204,7 @@ function App() {
           reorderedAgents.unshift(agent);
         }
 
-        const companyName =
-          agentSetKey === 'customerServiceRetail'
-            ? customerServiceRetailCompanyName
-            : agentSetKey === 'nika'
-              ? nikaCompanyName
-              : chatSupervisorCompanyName;
+        const companyName = nikaCompanyName;
         const guardrail = createModerationGuardrail(companyName);
 
         await connect({

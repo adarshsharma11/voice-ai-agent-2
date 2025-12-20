@@ -40,3 +40,6 @@ yarn-error.log*
 next-env.d.ts
 todo.md
 
+# local request/tool logging
+request-log.jsonl
+
