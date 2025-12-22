@@ -8,10 +8,21 @@
  *
  * Run with: node server.cjs
  * Or update package.json scripts to use this instead of next dev.
+ *
+ * PRODUCTION SAFETY (1GB RAM):
+ * - Rate limiting per IP (max 60 req/min, circuit breaker at 120)
+ * - WebSocket connection limits (max 5 concurrent per IP)
+ * - Bounded buffers (audioQueue, handledToolCallIds, pendingFunctionCalls)
+ * - Proper cleanup on disconnect
+ * - No polling, no reconnect storms, no self-calling webhooks
  */
 require('dotenv/config');
-process.on('uncaughtException', console.error);
-process.on('unhandledRejection', console.error);
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] uncaughtException:', err?.message || err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[FATAL] unhandledRejection:', err?.message || err);
+});
 
 const http = require('node:http');
 const next = require('next');
@@ -22,6 +33,114 @@ const port = parseInt(process.env.PORT || '3000', 10);
 
 const app = next({ dev, port });
 const handle = app.getRequestHandler();
+
+// ============================================================================
+// PRODUCTION SAFETY: Rate Limiting & Circuit Breakers
+// ============================================================================
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 60;  // 60 requests per minute per IP
+const RATE_LIMIT_CIRCUIT_BREAKER = 120; // Block IP entirely if exceeded
+const WS_MAX_CONNECTIONS_PER_IP = 5;
+
+// Stores: { ip: { count, windowStart, blocked } }
+const rateLimitStore = new Map();
+// Stores: { ip: Set<ws> }
+const wsConnectionsByIp = new Map();
+
+// Metrics (counters reset every minute for logging)
+let metricsRequestCount = 0;
+let metricsWsMessageCount = 0;
+let metricsLastReset = Date.now();
+
+function logMetrics() {
+  const now = Date.now();
+  if (now - metricsLastReset >= 60_000) {
+    if (metricsRequestCount > 0 || metricsWsMessageCount > 0) {
+      console.log(`[metrics] last 60s: http_requests=${metricsRequestCount}, ws_messages=${metricsWsMessageCount}`);
+    }
+    metricsRequestCount = 0;
+    metricsWsMessageCount = 0;
+    metricsLastReset = now;
+  }
+}
+
+function getClientIp(req) {
+  // Trust X-Forwarded-For if behind Caddy/nginx
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  let entry = rateLimitStore.get(ip);
+  
+  if (!entry) {
+    entry = { count: 0, windowStart: now, blocked: false };
+    rateLimitStore.set(ip, entry);
+  }
+  
+  // Reset window if expired
+  if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStart = now;
+    entry.blocked = false;
+  }
+  
+  // Check if blocked
+  if (entry.blocked) {
+    return { allowed: false, reason: 'circuit_breaker' };
+  }
+  
+  entry.count++;
+  
+  // Circuit breaker: block IP entirely
+  if (entry.count > RATE_LIMIT_CIRCUIT_BREAKER) {
+    entry.blocked = true;
+    console.warn(`[rate-limit] CIRCUIT BREAKER TRIPPED for ${ip} (${entry.count} requests)`);
+    return { allowed: false, reason: 'circuit_breaker' };
+  }
+  
+  // Soft limit: reject but don't block
+  if (entry.count > RATE_LIMIT_MAX_REQUESTS) {
+    return { allowed: false, reason: 'rate_limit' };
+  }
+  
+  return { allowed: true };
+}
+
+function canOpenWsConnection(ip) {
+  const connections = wsConnectionsByIp.get(ip);
+  if (!connections) return true;
+  return connections.size < WS_MAX_CONNECTIONS_PER_IP;
+}
+
+function trackWsConnection(ip, ws) {
+  if (!wsConnectionsByIp.has(ip)) {
+    wsConnectionsByIp.set(ip, new Set());
+  }
+  wsConnectionsByIp.get(ip).add(ws);
+}
+
+function untrackWsConnection(ip, ws) {
+  const connections = wsConnectionsByIp.get(ip);
+  if (connections) {
+    connections.delete(ws);
+    if (connections.size === 0) {
+      wsConnectionsByIp.delete(ip);
+    }
+  }
+}
+
+// Clean up stale rate limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitStore.entries()) {
+    if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS * 2) {
+      rateLimitStore.delete(ip);
+    }
+  }
+}, 300_000);
 
 async function postJson(url, body) {
   const res = await fetch(url, {
@@ -553,7 +672,24 @@ function allowedTools(agent) {
 app.prepare().then(() => {
   const server = http.createServer(async (req, res) => {
     try {
+      metricsRequestCount++;
+      logMetrics();
+      
+      const clientIp = getClientIp(req);
       const url = new URL(req.url || '/', `http://${req.headers.host}`);
+      
+      // Rate limiting (skip for health checks)
+      if (url.pathname !== '/api/health') {
+        const rateCheck = checkRateLimit(clientIp);
+        if (!rateCheck.allowed) {
+          console.warn(`[rate-limit] Rejected ${clientIp}: ${rateCheck.reason} - ${req.method} ${url.pathname}`);
+          res.statusCode = 429;
+          res.setHeader('Content-Type', 'application/json');
+          res.setHeader('Retry-After', '60');
+          res.end(JSON.stringify({ error: 'Too many requests', reason: rateCheck.reason }));
+          return;
+        }
+      }
 
       // Twilio Voice webhooks (TwiML)
       const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/g, '');
@@ -634,6 +770,15 @@ app.prepare().then(() => {
       return;
     }
 
+    const clientIp = getClientIp(req);
+    
+    // WebSocket connection limiting
+    if (!canOpenWsConnection(clientIp)) {
+      console.warn(`[ws-limit] Rejected WebSocket from ${clientIp}: too many connections`);
+      socket.destroy();
+      return;
+    }
+
     // Validate stream secret
     const token = url.searchParams.get('token');
     const expected = process.env.STREAM_SECRET;
@@ -650,16 +795,27 @@ app.prepare().then(() => {
       }
     }
 
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      // Track connection for limiting
+      trackWsConnection(clientIp, ws);
+      ws._clientIp = clientIp; // Store for cleanup
+      wss.emit('connection', ws, req);
+    });
   });
 
   wss.on('connection', (ws, req) => {
     console.log('[twilio] WebSocket connected');
 
+    // PRODUCTION SAFETY: Bounded buffer limits
+    const MAX_AUDIO_QUEUE_SIZE = 500;      // ~5 seconds of audio chunks
+    const MAX_HANDLED_TOOL_IDS = 100;      // Max tool calls per session
+    const MAX_PENDING_FUNCTION_CALLS = 50; // Max concurrent pending calls
+
     let streamSid = null;
     let gotFirstMedia = false;
     let gotFirstDelta = false;
     let agent = 'customer_service';
+    let wsMessageCount = 0; // Per-connection message counter
 
     try {
       const url = new URL(req.url || '/', `http://${req.headers.host}`);
@@ -669,7 +825,7 @@ app.prepare().then(() => {
     let openaiWs = null;
     let openaiStarted = false;
 
-    // Audio buffering for smoother phone delivery
+    // Audio buffering for smoother phone delivery (BOUNDED)
     let audioQueue = [];
     let isSending = false;
     let lastAudioDeltaAt = 0;
@@ -682,11 +838,27 @@ app.prepare().then(() => {
       notes: [],
     };
 
-    // Deduplicate tool calls (OpenAI may emit multiple related events per call).
+    // Deduplicate tool calls (BOUNDED - clear oldest if exceeded)
     const handledToolCallIds = new Set();
+    const handledToolCallOrder = []; // Track insertion order for cleanup
     
-    // Accumulate function call arguments (they stream in chunks)
+    // Accumulate function call arguments (BOUNDED)
     const pendingFunctionCalls = new Map(); // call_id -> { name, arguments }
+    
+    // Helper to track tool call IDs with bounded size
+    function addHandledToolCallId(callId) {
+      if (handledToolCallIds.has(callId)) return false;
+      
+      // Remove oldest if at capacity
+      while (handledToolCallOrder.length >= MAX_HANDLED_TOOL_IDS) {
+        const oldest = handledToolCallOrder.shift();
+        handledToolCallIds.delete(oldest);
+      }
+      
+      handledToolCallIds.add(callId);
+      handledToolCallOrder.push(callId);
+      return true;
+    }
 
     const sendToOpenAI = (ev) => {
       try {
@@ -728,6 +900,10 @@ app.prepare().then(() => {
     };
 
     const queueAudio = (payload) => {
+      // PRODUCTION SAFETY: Drop oldest chunks if queue is full
+      if (audioQueue.length >= MAX_AUDIO_QUEUE_SIZE) {
+        audioQueue.shift(); // Drop oldest chunk
+      }
       audioQueue.push(payload);
       processAudioQueue();
     };
@@ -842,10 +1018,16 @@ app.prepare().then(() => {
         }
 
         // ---- Accumulate function call arguments (streamed in deltas) ----
+        // PRODUCTION SAFETY: Bounded pending function calls
         if (ev?.type === 'response.function_call_arguments.delta') {
           const cid = ev.call_id;
           if (cid) {
             if (!pendingFunctionCalls.has(cid)) {
+              // Reject if at capacity
+              if (pendingFunctionCalls.size >= MAX_PENDING_FUNCTION_CALLS) {
+                console.warn('[safety] Dropping function call - pending queue full');
+                return;
+              }
               pendingFunctionCalls.set(cid, { name: '', arguments: '' });
             }
             const pending = pendingFunctionCalls.get(cid);
@@ -858,6 +1040,10 @@ app.prepare().then(() => {
           const cid = ev.item.call_id;
           if (cid) {
             if (!pendingFunctionCalls.has(cid)) {
+              if (pendingFunctionCalls.size >= MAX_PENDING_FUNCTION_CALLS) {
+                console.warn('[safety] Dropping function call - pending queue full');
+                return;
+              }
               pendingFunctionCalls.set(cid, { name: '', arguments: '' });
             }
             pendingFunctionCalls.get(cid).name = ev.item.name || '';
@@ -918,8 +1104,9 @@ app.prepare().then(() => {
           
           // Clean up any pending data
           pendingFunctionCalls.delete(callId);
-          if (handledToolCallIds.has(callId)) return;
-          handledToolCallIds.add(callId);
+          
+          // PRODUCTION SAFETY: Use bounded tracking
+          if (!addHandledToolCallId(callId)) return; // Already handled
 
           console.log('[toolcall] start', { callId, fnName });
           console.log('[toolcall] raw argsStr:', argsStr);
@@ -1185,22 +1372,12 @@ app.prepare().then(() => {
             },
           });
           console.log('[toolcall] output_sent', { callId, fnName });
-          // IMPORTANT: do NOT call response.create here.
-          // The model is already in an active response when it calls tools, and it will
-          // continue once it receives function_call_output. Calling response.create here
-          // can trigger 'conversation_already_has_active_response'.
-          //
-          // If we don't see audio resume shortly after tool output, send one best-effort
-          // response.create as a fallback (and ignore any "active response" errors).
-          const outputSentAt = Date.now();
-          setTimeout(() => {
-            try {
-              if (lastAudioDeltaAt && lastAudioDeltaAt >= outputSentAt) return;
-              if (openaiWs?.readyState !== WebSocket.OPEN) return;
-              sendToOpenAI({ type: 'response.create' });
-              console.log('[toolcall] fallback_response_create', { callId, fnName });
-            } catch {}
-          }, 700);
+          
+          // PRODUCTION SAFETY: The model should automatically continue after receiving
+          // function_call_output. We removed the fallback setTimeout that could cause
+          // 'conversation_already_has_active_response' errors or repeated triggers.
+          // If audio doesn't resume, the model is done or there's an issue - we don't
+          // retry automatically to prevent runaway traffic.
         };
 
         // Fire-and-forget tool handling so audio still streams.
@@ -1226,6 +1403,11 @@ app.prepare().then(() => {
     };
 
     ws.on('message', (data) => {
+      // PRODUCTION SAFETY: Track message count
+      wsMessageCount++;
+      metricsWsMessageCount++;
+      logMetrics();
+      
       let msg;
       try {
         msg = JSON.parse(String(data));
@@ -1283,6 +1465,17 @@ app.prepare().then(() => {
     ws.on('close', () => {
       console.log('[twilio] WebSocket closed');
       closeOpenAI();
+      
+      // PRODUCTION SAFETY: Clean up connection tracking
+      if (ws._clientIp) {
+        untrackWsConnection(ws._clientIp, ws);
+      }
+      
+      // Clear all buffers to free memory
+      audioQueue.length = 0;
+      handledToolCallIds.clear();
+      handledToolCallOrder.length = 0;
+      pendingFunctionCalls.clear();
     });
 
     ws.on('error', (e) => {
