@@ -12,7 +12,10 @@
  * PRODUCTION SAFETY (1GB RAM):
  * - Rate limiting per IP (max 60 req/min, circuit breaker at 120)
  * - WebSocket connection limits (max 5 concurrent per IP)
+ * - Reconnect cooldown to prevent connection storms
  * - Bounded buffers (audioQueue, handledToolCallIds, pendingFunctionCalls)
+ * - Audio frame aggregation to reduce PPS
+ * - Backpressure-driven audio sending
  * - Proper cleanup on disconnect
  * - No polling, no reconnect storms, no self-calling webhooks
  */
@@ -31,6 +34,10 @@ const { WebSocketServer, WebSocket } = require('ws');
 const dev = process.env.NODE_ENV !== 'production';
 const port = parseInt(process.env.PORT || '3000', 10);
 
+// Debug logging - gate behind DEBUG env var
+const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
+const debugLog = (...args) => { if (DEBUG) console.log(...args); };
+
 const app = next({ dev, port });
 const handle = app.getRequestHandler();
 
@@ -42,24 +49,36 @@ const RATE_LIMIT_MAX_REQUESTS = 60;  // 60 requests per minute per IP
 const RATE_LIMIT_CIRCUIT_BREAKER = 120; // Block IP entirely if exceeded
 const WS_MAX_CONNECTIONS_PER_IP = 5;
 
+// ============================================================================
+// RECONNECT STORM PREVENTION: Cooldown tracking
+// ============================================================================
+const RECONNECT_COOLDOWN_MS = 60_000; // 60 seconds between reconnects from same IP+streamSid
+const WS_REJECTED_COOLDOWN_MS = 30_000; // 30 second cooldown after rejection
+
 // Stores: { ip: { count, windowStart, blocked } }
 const rateLimitStore = new Map();
 // Stores: { ip: Set<ws> }
 const wsConnectionsByIp = new Map();
+// Stores: { `${ip}:${streamSid}` => lastAttemptTimestamp }
+const reconnectCooldowns = new Map();
+// Stores: { ip => lastRejectionTimestamp }
+const ipRejectionCooldowns = new Map();
 
 // Metrics (counters reset every minute for logging)
 let metricsRequestCount = 0;
 let metricsWsMessageCount = 0;
+let metricsWsRejections = 0;
 let metricsLastReset = Date.now();
 
 function logMetrics() {
   const now = Date.now();
   if (now - metricsLastReset >= 60_000) {
-    if (metricsRequestCount > 0 || metricsWsMessageCount > 0) {
-      console.log(`[metrics] last 60s: http_requests=${metricsRequestCount}, ws_messages=${metricsWsMessageCount}`);
+    if (metricsRequestCount > 0 || metricsWsMessageCount > 0 || metricsWsRejections > 0) {
+      console.log(`[metrics] last 60s: http_requests=${metricsRequestCount}, ws_messages=${metricsWsMessageCount}, ws_rejections=${metricsWsRejections}`);
     }
     metricsRequestCount = 0;
     metricsWsMessageCount = 0;
+    metricsWsRejections = 0;
     metricsLastReset = now;
   }
 }
@@ -69,6 +88,26 @@ function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (xff) return String(xff).split(',')[0].trim();
   return req.socket?.remoteAddress || 'unknown';
+}
+
+// getPublicHost is available if needed for debugging, but not currently used
+// since TwiML generation uses PUBLIC_URL directly
+function _getPublicHost(req) {
+  // Prefer an explicit host env var (no scheme), else derive from PUBLIC_URL, else Host header.
+  const envHost = String(process.env.PUBLIC_HOST || '').trim();
+  if (envHost) return envHost.replace(/^https?:\/\//, '').replace(/\/+$/g, '');
+
+  const publicUrl = String(process.env.PUBLIC_URL || '').trim();
+  if (publicUrl) {
+    try {
+      const u = new URL(publicUrl);
+      return u.host;
+    } catch {
+      return publicUrl.replace(/^https?:\/\//, '').replace(/\/+$/g, '');
+    }
+  }
+
+  return String(req.headers.host || 'localhost').trim();
 }
 
 function checkRateLimit(ip) {
@@ -132,12 +171,58 @@ function untrackWsConnection(ip, ws) {
   }
 }
 
+// ============================================================================
+// RECONNECT COOLDOWN: Prevent rapid reconnect attempts
+// ============================================================================
+function checkReconnectCooldown(ip, streamSid) {
+  const now = Date.now();
+  
+  // Check IP-level rejection cooldown first
+  const ipCooldown = ipRejectionCooldowns.get(ip);
+  if (ipCooldown && now - ipCooldown < WS_REJECTED_COOLDOWN_MS) {
+    return { allowed: false, reason: 'ip_rejection_cooldown', waitMs: WS_REJECTED_COOLDOWN_MS - (now - ipCooldown) };
+  }
+  
+  // Check specific stream cooldown if we have a streamSid
+  if (streamSid) {
+    const key = `${ip}:${streamSid}`;
+    const lastAttempt = reconnectCooldowns.get(key);
+    if (lastAttempt && now - lastAttempt < RECONNECT_COOLDOWN_MS) {
+      return { allowed: false, reason: 'stream_cooldown', waitMs: RECONNECT_COOLDOWN_MS - (now - lastAttempt) };
+    }
+  }
+  
+  return { allowed: true };
+}
+
+function trackConnectionAttempt(ip, streamSid) {
+  if (streamSid) {
+    reconnectCooldowns.set(`${ip}:${streamSid}`, Date.now());
+  }
+}
+
+function trackRejection(ip) {
+  metricsWsRejections++;
+  ipRejectionCooldowns.set(ip, Date.now());
+}
+
 // Clean up stale rate limit entries every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of rateLimitStore.entries()) {
     if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS * 2) {
       rateLimitStore.delete(ip);
+    }
+  }
+  // Clean up old cooldowns
+  for (const [key, timestamp] of reconnectCooldowns.entries()) {
+    if (now - timestamp > RECONNECT_COOLDOWN_MS * 2) {
+      reconnectCooldowns.delete(key);
+    }
+  }
+  for (const [ip, timestamp] of ipRejectionCooldowns.entries()) {
+    if (now - timestamp > WS_REJECTED_COOLDOWN_MS * 2) {
+      ipRejectionCooldowns.delete(ip);
     }
   }
 }, 300_000);
@@ -282,7 +367,8 @@ function normalizeAgentKey(raw) {
   return 'customer_service';
 }
 
-function agentToEagerness(agent) {
+// agentToEagerness is available for VAD customization if needed
+function _agentToEagerness(agent) {
   // Phone audio benefits from slightly lower eagerness to avoid cutting off
   if (agent === 'outbound') return 'medium';
   if (agent === 'customer_service') return 'low';
@@ -420,7 +506,7 @@ function allowedTools(agent) {
       type: 'function',
       name: 'detect_intent',
       description:
-        'Given the caller’s latest utterance, returns a simple intent classification with confidence and optional entities.',
+        "Given the caller's latest utterance, returns a simple intent classification with confidence and optional entities.",
       parameters: {
         type: 'object',
         properties: { utterance: { type: 'string' } },
@@ -531,7 +617,7 @@ function allowedTools(agent) {
       type: 'function',
       name: 'calendar_check_time_nl',
       description:
-        'Checks a specific natural-language time like \"Friday 4pm\" in a timezone. Use this when the user gives a day+time instead of an ISO datetime.',
+        'Checks a specific natural-language time like "Friday 4pm" in a timezone. Use this when the user gives a day+time instead of an ISO datetime.',
       parameters: {
         type: 'object',
         properties: {
@@ -600,7 +686,7 @@ function allowedTools(agent) {
       {
         type: 'function',
         name: 'email_get',
-        description: 'Fetches a Gmail message by ID. Use format=\"metadata\" unless you truly need full body.',
+        description: 'Fetches a Gmail message by ID. Use format="metadata" unless you truly need full body.',
         parameters: {
           type: 'object',
           properties: {
@@ -617,7 +703,7 @@ function allowedTools(agent) {
         type: 'function',
         name: 'email_get_latest',
         description:
-          'Fetches your most recent email message (metadata by default). Use this when the user asks for “my latest email”.',
+          'Fetches your most recent email message (metadata by default). Use this when the user asks for "my latest email".',
         parameters: {
           type: 'object',
           properties: { format: { type: 'string', enum: ['metadata', 'full'] } },
@@ -669,8 +755,75 @@ function allowedTools(agent) {
   return base;
 }
 
+// ============================================================================
+// TwiML GENERATION
+// ============================================================================
+// TwiML is generated here for bidirectional audio streaming.
+// The Stream URL includes the agent and token as both query params AND <Parameter> tags
+// because Twilio can strip query params during WebSocket upgrades depending on proxy config.
+function generateTwiml(streamUrl, params = {}) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${streamUrl.replace(/&/g, '&amp;')}">
+${Object.entries(params)
+  .map(([k, v]) => `      <Parameter name="${k}" value="${String(v).replace(/&/g, '&amp;')}" />`)
+  .join('\n')}
+    </Stream>
+  </Connect>
+</Response>`;
+}
+
 app.prepare().then(() => {
-  const server = http.createServer(async (req, res) => {
+  const server = http.createServer((req, res) => {
+    // ========================================================================
+    // TWILIO WEBHOOKS: Must respond immediately with TwiML
+    // These handlers are synchronous and have zero dependencies to prevent hangs
+    // ========================================================================
+    
+    // Inbound calls: /twilio/voice
+    if (req.method === 'POST' && req.url === '/twilio/voice') {
+      const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/g, '');
+      const streamSecret = process.env.STREAM_SECRET || '';
+      
+      if (!publicUrl || !streamSecret) {
+        // Fail fast with a spoken error - don't hang
+        res.writeHead(200, { 'Content-Type': 'text/xml' });
+        res.end('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Server configuration error. Please try again later.</Say></Response>');
+        return;
+      }
+      
+      const baseWs = publicUrl.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+      const streamUrl = `${baseWs}/twilio/stream?agent=assistant&token=${encodeURIComponent(streamSecret)}`;
+      
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(generateTwiml(streamUrl, { agent: 'assistant', token: streamSecret }));
+      return;
+    }
+    
+    // Outbound calls: /twilio/outbound
+    if ((req.method === 'GET' || req.method === 'POST') && req.url?.startsWith('/twilio/outbound')) {
+      const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/g, '');
+      const streamSecret = process.env.STREAM_SECRET || '';
+      
+      if (!publicUrl || !streamSecret) {
+        res.writeHead(200, { 'Content-Type': 'text/xml' });
+        res.end('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Server configuration error.</Say></Response>');
+        return;
+      }
+      
+      const url = new URL(req.url || '/', `http://${req.headers.host}`);
+      const agent = normalizeAgentKey(url.searchParams.get('agent') || 'outbound');
+      const baseWs = publicUrl.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+      const streamUrl = `${baseWs}/twilio/stream?agent=${agent}&token=${encodeURIComponent(streamSecret)}`;
+      
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(generateTwiml(streamUrl, { agent, token: streamSecret }));
+      return;
+    }
+
+    // Wrap remaining logic in async IIFE so we can still use await inside
+    (async () => {
     try {
       metricsRequestCount++;
       logMetrics();
@@ -691,74 +844,13 @@ app.prepare().then(() => {
         }
       }
 
-      // Twilio Voice webhooks (TwiML)
-      const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/g, '');
-      const streamSecret = process.env.STREAM_SECRET || '';
-
-      if (!publicUrl || !streamSecret) {
-        if (url.pathname === '/twilio/voice' || url.pathname === '/twilio/outbound') {
-          res.statusCode = 500;
-          res.setHeader('Content-Type', 'text/plain');
-          res.end('Missing PUBLIC_URL or STREAM_SECRET in .env');
-          return;
-        }
-      }
-
-      const baseWs = publicUrl.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:') || `ws://${req.headers.host}`;
-
-      // TwiML for bidirectional audio
-      // IMPORTANT: Twilio may strip query params on the websocket upgrade.
-      // Use <Parameter> so agent/token survive into the Twilio "start" event.
-      const twiml = (streamUrl, params = {}) => `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${streamUrl.replace(/&/g, '&amp;')}">
-      ${Object.entries(params)
-        .map(([k, v]) => `      <Parameter name="${k}" value="${String(v).replace(/&/g, '&amp;')}" />`)
-        .join('\n')}
-    </Stream>
-  </Connect>
-</Response>`;
-
-      // Inbound calls -> Personal Assistant agent (default)
-      if (url.pathname === '/twilio/voice' && req.method === 'POST') {
-        const streamUrl = new URL(`${baseWs}/twilio/stream`);
-        streamUrl.searchParams.set('agent', 'assistant');
-        streamUrl.searchParams.set('token', streamSecret);
-        res.statusCode = 200;
-        res.setHeader('Content-Type', 'text/xml');
-        res.end(
-          twiml(streamUrl.toString(), {
-            agent: 'assistant',
-            token: streamSecret,
-          }),
-        );
-        return;
-      }
-
-      // Outbound calls
-      if (url.pathname === '/twilio/outbound' && (req.method === 'GET' || req.method === 'POST')) {
-        const agent = normalizeAgentKey(url.searchParams.get('agent') || 'outbound');
-        const streamUrl = new URL(`${baseWs}/twilio/stream`);
-        streamUrl.searchParams.set('agent', agent);
-        streamUrl.searchParams.set('token', streamSecret);
-        res.statusCode = 200;
-        res.setHeader('Content-Type', 'text/xml');
-        res.end(
-          twiml(streamUrl.toString(), {
-            agent,
-            token: streamSecret,
-          }),
-        );
-        return;
-      }
-
       await handle(req, res);
     } catch (err) {
       console.error('[server] request error', err);
       res.statusCode = 500;
       res.end('Internal Server Error');
     }
+    })(); // Close async IIFE
   });
 
   const wss = new WebSocketServer({ noServer: true });
@@ -772,28 +864,49 @@ app.prepare().then(() => {
 
     const clientIp = getClientIp(req);
     
+    // ========================================================================
+    // RECONNECT STORM PREVENTION: Validate before accepting connection
+    // ========================================================================
+    
+    // Check IP-level cooldown first (prevents rapid retries after rejection)
+    const cooldownCheck = checkReconnectCooldown(clientIp, null);
+    if (!cooldownCheck.allowed) {
+      debugLog(`[ws-reject] ${clientIp}: ${cooldownCheck.reason} (wait ${cooldownCheck.waitMs}ms)`);
+      trackRejection(clientIp);
+      socket.destroy();
+      return;
+    }
+    
     // WebSocket connection limiting
     if (!canOpenWsConnection(clientIp)) {
       console.warn(`[ws-limit] Rejected WebSocket from ${clientIp}: too many connections`);
+      trackRejection(clientIp);
       socket.destroy();
       return;
     }
 
-    // Validate stream secret
+    // Validate stream secret STRICTLY
+    // If STREAM_SECRET is set, we MUST have a matching token
     const token = url.searchParams.get('token');
     const expected = process.env.STREAM_SECRET;
-    // Twilio sometimes strips query params on the websocket upgrade depending on configuration.
-    // To avoid immediate call hangups, treat a missing token as a warning, but only reject when
-    // a token is provided and it is incorrect.
+    
     if (expected) {
       if (!token) {
-        console.log('[twilio] stream token missing on websocket upgrade (allowing)');
-      } else if (token !== expected) {
-        console.log('[twilio] invalid stream token (rejecting)');
+        // Token missing - this is a misconfiguration. Reject cleanly with cooldown.
+        console.warn(`[ws-auth] Rejected ${clientIp}: token missing (STREAM_SECRET is set)`);
+        trackRejection(clientIp);
+        socket.destroy();
+        return;
+      }
+      if (token !== expected) {
+        // Token mismatch - reject with cooldown
+        console.warn(`[ws-auth] Rejected ${clientIp}: token mismatch`);
+        trackRejection(clientIp);
         socket.destroy();
         return;
       }
     }
+    // If STREAM_SECRET is not set, we accept any connection (dev mode)
 
     wss.handleUpgrade(req, socket, head, (ws) => {
       // Track connection for limiting
@@ -815,7 +928,6 @@ app.prepare().then(() => {
     let gotFirstMedia = false;
     let gotFirstDelta = false;
     let agent = 'customer_service';
-    let wsMessageCount = 0; // Per-connection message counter
 
     try {
       const url = new URL(req.url || '/', `http://${req.headers.host}`);
@@ -825,10 +937,15 @@ app.prepare().then(() => {
     let openaiWs = null;
     let openaiStarted = false;
 
-    // Audio buffering for smoother phone delivery (BOUNDED)
-    let audioQueue = [];
-    let isSending = false;
-    let lastAudioDeltaAt = 0;
+    // ========================================================================
+    // AUDIO AGGREGATION: Reduce PPS by batching frames
+    // ========================================================================
+    const AUDIO_AGGREGATION_MS = 100;        // Aggregate audio into 100ms chunks
+    const AUDIO_AGGREGATION_MAX_CHUNKS = 10; // Max chunks before forcing flush
+    
+    // Audio buffering with aggregation for smoother phone delivery (BOUNDED)
+    let audioAggregationBuffer = [];
+    let audioAggregationTimer = null;
 
     // Per-call memory for mock tools.
     const callMemory = {
@@ -870,42 +987,69 @@ app.prepare().then(() => {
       }
     };
 
+    // ========================================================================
+    // BACKPRESSURE-DRIVEN AUDIO SENDING
+    // Only send when the socket is ready and writable
+    // ========================================================================
     const sendToTwilio = (payload) => {
       try {
+        // Check socket is open AND writable (backpressure check)
         if (ws.readyState === WebSocket.OPEN && streamSid) {
+          // Check bufferedAmount to detect backpressure
+          // If buffer is too full, skip this chunk to prevent memory buildup
+          if (ws.bufferedAmount > 64 * 1024) { // 64KB threshold
+            debugLog('[twilio] Backpressure detected, dropping audio chunk');
+            return false;
+          }
           ws.send(JSON.stringify({
             event: 'media',
             streamSid,
             media: { payload },
           }));
+          return true;
         }
       } catch (e) {
         console.error('[twilio] send error', e);
       }
+      return false;
     };
 
-    // Process audio queue to avoid overwhelming Twilio
-    const processAudioQueue = () => {
-      if (isSending || audioQueue.length === 0) return;
-      isSending = true;
-
-      const chunk = audioQueue.shift();
-      sendToTwilio(chunk);
-
-      // Small delay between chunks for phone line stability
-      setTimeout(() => {
-        isSending = false;
-        processAudioQueue();
-      }, 10);
+    // Flush aggregated audio to Twilio
+    const flushAudioAggregation = () => {
+      if (audioAggregationTimer) {
+        clearTimeout(audioAggregationTimer);
+        audioAggregationTimer = null;
+      }
+      
+      if (audioAggregationBuffer.length === 0) return;
+      
+      // Concatenate all base64 chunks into one
+      // Note: For G.711 μ-law, we can simply concatenate the raw samples
+      const combined = audioAggregationBuffer.join('');
+      audioAggregationBuffer = [];
+      
+      sendToTwilio(combined);
     };
 
     const queueAudio = (payload) => {
-      // PRODUCTION SAFETY: Drop oldest chunks if queue is full
-      if (audioQueue.length >= MAX_AUDIO_QUEUE_SIZE) {
-        audioQueue.shift(); // Drop oldest chunk
+      // PRODUCTION SAFETY: Drop if buffer is full
+      if (audioAggregationBuffer.length >= MAX_AUDIO_QUEUE_SIZE) {
+        debugLog('[audio] Dropping chunk - aggregation buffer full');
+        return;
       }
-      audioQueue.push(payload);
-      processAudioQueue();
+      
+      audioAggregationBuffer.push(payload);
+      
+      // Flush if we've accumulated enough chunks
+      if (audioAggregationBuffer.length >= AUDIO_AGGREGATION_MAX_CHUNKS) {
+        flushAudioAggregation();
+        return;
+      }
+      
+      // Start aggregation timer if not already running
+      if (!audioAggregationTimer) {
+        audioAggregationTimer = setTimeout(flushAudioAggregation, AUDIO_AGGREGATION_MS);
+      }
     };
 
     const closeOpenAI = () => {
@@ -913,7 +1057,9 @@ app.prepare().then(() => {
         openaiWs?.close();
       } catch {}
       openaiWs = null;
-      audioQueue = [];
+      // Flush any remaining audio before closing
+      flushAudioAggregation();
+      audioAggregationBuffer = [];
     };
 
     const startOpenAI = () => {
@@ -988,12 +1134,12 @@ app.prepare().then(() => {
           return;
         }
 
-        // DEBUG: Log ALL non-audio events
-        if (ev?.type && !ev.type.includes('audio') && !ev.type.includes('transcription')) {
-          console.log('[openai] EVENT:', ev.type, JSON.stringify(ev).slice(0, 500));
+        // DEBUG: Log non-audio events (gated)
+        if (DEBUG && ev?.type && !ev.type.includes('audio') && !ev.type.includes('transcription')) {
+          debugLog('[openai] EVENT:', ev.type, JSON.stringify(ev).slice(0, 500));
         }
 
-        // Audio delta -> queue for Twilio
+        // Audio delta -> queue for Twilio (with aggregation)
         if (ev?.type === 'response.audio.delta' && ev.delta) {
           if (!gotFirstDelta) {
             console.log('[openai] First audio delta received');
@@ -1059,7 +1205,7 @@ app.prepare().then(() => {
               name: ev.item.name || '', 
               arguments: ev.item.arguments || '' 
             });
-            console.log('[DEBUG] output_item.done has full args:', ev.item.name, ev.item.arguments?.slice(0, 200));
+            debugLog('[DEBUG] output_item.done has full args:', ev.item.name, ev.item.arguments?.slice(0, 200));
           }
         }
         
@@ -1071,7 +1217,7 @@ app.prepare().then(() => {
                 name: item.name || '',
                 arguments: item.arguments || '',
               });
-              console.log('[DEBUG] response.done has function_call:', item.name, item.arguments?.slice(0, 200));
+              debugLog('[DEBUG] response.done has function_call:', item.name, item.arguments?.slice(0, 200));
             }
           }
         }
@@ -1108,12 +1254,12 @@ app.prepare().then(() => {
           // PRODUCTION SAFETY: Use bounded tracking
           if (!addHandledToolCallId(callId)) return; // Already handled
 
-          console.log('[toolcall] start', { callId, fnName });
-          console.log('[toolcall] raw argsStr:', argsStr);
+          debugLog('[toolcall] start', { callId, fnName });
+          debugLog('[toolcall] raw argsStr:', argsStr);
 
           const parsed = safeJsonParse(argsStr || '{}');
           const args = parsed.ok ? parsed.value : {};
-          console.log('[toolcall] parsed args:', JSON.stringify(args));
+          debugLog('[toolcall] parsed args:', JSON.stringify(args));
 
           const sessionId = streamSid || 'unknown-stream';
 
@@ -1180,11 +1326,11 @@ app.prepare().then(() => {
 
             // Real tools backed by Next API routes
             if (name === 'calendar_find_slots') {
-              console.log('[calendar_find_slots] ALL args:', JSON.stringify(toolArgs));
+              debugLog('[calendar_find_slots] ALL args:', JSON.stringify(toolArgs));
               return await postJson(`http://127.0.0.1:${port}/api/google-calendar`, { action: 'find_slots', ...toolArgs });
             }
             if (name === 'calendar_check_time') {
-              console.log('[calendar_check_time] ALL args:', JSON.stringify(toolArgs));
+              debugLog('[calendar_check_time] ALL args:', JSON.stringify(toolArgs));
               const startIso = toolArgs?.start;
               const tz = toolArgs?.timezone;
               const duration = Number(toolArgs?.duration_minutes);
@@ -1215,7 +1361,7 @@ app.prepare().then(() => {
               };
             }
             if (name === 'calendar_check_time_nl') {
-              console.log('[calendar_check_time_nl] ALL args:', JSON.stringify(toolArgs));
+              debugLog('[calendar_check_time_nl] ALL args:', JSON.stringify(toolArgs));
               const when = String(toolArgs?.when || toolArgs?.time || toolArgs?.datetime || '');
               const tz = inferTimeZone({ explicitTz: toolArgs?.timezone, text: when });
               // Default to 30 minutes if not provided
@@ -1301,11 +1447,11 @@ app.prepare().then(() => {
               });
             }
             if (name === 'email_draft_create') {
-              console.log('[email_draft_create] ALL args:', JSON.stringify(toolArgs));
+              debugLog('[email_draft_create] ALL args:', JSON.stringify(toolArgs));
               const rawTo = toolArgs?.to || toolArgs?.recipient || toolArgs?.email || toolArgs?.address;
-              console.log('[email_draft_create] raw to:', JSON.stringify(rawTo));
+              debugLog('[email_draft_create] raw to:', JSON.stringify(rawTo));
               const normalizedTo = normalizeEmailAddress(rawTo);
-              console.log('[email_draft_create] normalized to:', normalizedTo);
+              debugLog('[email_draft_create] normalized to:', normalizedTo);
               if (!normalizedTo) throw new Error('Invalid email address. Please provide something like name@example.com');
               return await postJson(`http://127.0.0.1:${port}/api/gmail`, {
                 action: 'draft_create',
@@ -1320,12 +1466,12 @@ app.prepare().then(() => {
             }
             if (name === 'email_send') {
               // Combined create-and-send: create draft, then send it immediately
-              console.log('[email_send] ALL args:', JSON.stringify(toolArgs));
+              debugLog('[email_send] ALL args:', JSON.stringify(toolArgs));
               // Try multiple possible field names the model might use
               const rawTo = toolArgs?.to || toolArgs?.recipient || toolArgs?.email || toolArgs?.address;
-              console.log('[email_send] raw to:', JSON.stringify(rawTo));
+              debugLog('[email_send] raw to:', JSON.stringify(rawTo));
               const normalizedTo = normalizeEmailAddress(rawTo);
-              console.log('[email_send] normalized to:', normalizedTo);
+              debugLog('[email_send] normalized to:', normalizedTo);
               if (!normalizedTo) throw new Error('Invalid email address. Please provide something like name@example.com');
               
               // Step 1: Create draft
@@ -1371,7 +1517,7 @@ app.prepare().then(() => {
               output: JSON.stringify(result),
             },
           });
-          console.log('[toolcall] output_sent', { callId, fnName });
+          debugLog('[toolcall] output_sent', { callId, fnName });
           
           // PRODUCTION SAFETY: The model should automatically continue after receiving
           // function_call_output. We removed the fallback setTimeout that could cause
@@ -1402,9 +1548,47 @@ app.prepare().then(() => {
       });
     };
 
+    // ========================================================================
+    // INBOUND AUDIO AGGREGATION: Batch Twilio → OpenAI frames
+    // ========================================================================
+    const INBOUND_AGGREGATION_MS = 100;
+    let inboundAudioBuffer = [];
+    let inboundAggregationTimer = null;
+    
+    const flushInboundAudio = () => {
+      if (inboundAggregationTimer) {
+        clearTimeout(inboundAggregationTimer);
+        inboundAggregationTimer = null;
+      }
+      
+      if (inboundAudioBuffer.length === 0) return;
+      
+      // Send aggregated audio to OpenAI
+      const combined = inboundAudioBuffer.join('');
+      inboundAudioBuffer = [];
+      
+      sendToOpenAI({
+        type: 'input_audio_buffer.append',
+        audio: combined,
+      });
+    };
+    
+    const queueInboundAudio = (payload) => {
+      inboundAudioBuffer.push(payload);
+      
+      // Flush if buffer is getting large
+      if (inboundAudioBuffer.length >= 10) {
+        flushInboundAudio();
+        return;
+      }
+      
+      if (!inboundAggregationTimer) {
+        inboundAggregationTimer = setTimeout(flushInboundAudio, INBOUND_AGGREGATION_MS);
+      }
+    };
+
     ws.on('message', (data) => {
-      // PRODUCTION SAFETY: Track message count
-      wsMessageCount++;
+      // PRODUCTION SAFETY: Track message count (global metrics)
       metricsWsMessageCount++;
       logMetrics();
       
@@ -1416,19 +1600,26 @@ app.prepare().then(() => {
       }
 
       if (msg?.event === 'connected') {
-        console.log('[twilio] Stream connected');
+        debugLog('[twilio] Stream connected');
         return;
       }
 
       if (msg?.event === 'start') {
         streamSid = msg.start?.streamSid;
+        
+        // Track this connection attempt for cooldown
+        if (ws._clientIp && streamSid) {
+          trackConnectionAttempt(ws._clientIp, streamSid);
+        }
+        
         // Twilio customParameters are the reliable way to get agent/token (query params can be stripped).
         try {
           const cp = msg.start?.customParameters || msg.start?.custom_parameters || {};
           if (cp.agent) agent = normalizeAgentKey(cp.agent);
           const expected = process.env.STREAM_SECRET;
           if (expected && cp.token && cp.token !== expected) {
-            console.log('[twilio] invalid stream token in start event (closing)');
+            console.warn('[twilio] invalid stream token in start event (closing)');
+            if (ws._clientIp) trackRejection(ws._clientIp);
             ws.close();
             return;
           }
@@ -1445,18 +1636,16 @@ app.prepare().then(() => {
           gotFirstMedia = true;
         }
 
-        // Forward audio to OpenAI
+        // Forward audio to OpenAI (with aggregation)
         if (msg.media?.payload) {
-          sendToOpenAI({
-            type: 'input_audio_buffer.append',
-            audio: msg.media.payload,
-          });
+          queueInboundAudio(msg.media.payload);
         }
         return;
       }
 
       if (msg?.event === 'stop') {
         console.log('[twilio] Stream stopped');
+        flushInboundAudio();
         closeOpenAI();
         return;
       }
@@ -1464,7 +1653,18 @@ app.prepare().then(() => {
 
     ws.on('close', () => {
       console.log('[twilio] WebSocket closed');
+      flushInboundAudio();
       closeOpenAI();
+      
+      // Clear aggregation timers
+      if (audioAggregationTimer) {
+        clearTimeout(audioAggregationTimer);
+        audioAggregationTimer = null;
+      }
+      if (inboundAggregationTimer) {
+        clearTimeout(inboundAggregationTimer);
+        inboundAggregationTimer = null;
+      }
       
       // PRODUCTION SAFETY: Clean up connection tracking
       if (ws._clientIp) {
@@ -1472,7 +1672,8 @@ app.prepare().then(() => {
       }
       
       // Clear all buffers to free memory
-      audioQueue.length = 0;
+      audioAggregationBuffer.length = 0;
+      inboundAudioBuffer.length = 0;
       handledToolCallIds.clear();
       handledToolCallOrder.length = 0;
       pendingFunctionCalls.clear();
@@ -1486,7 +1687,7 @@ app.prepare().then(() => {
   server.listen(port, () => {
     console.log(`\n[server] Ready on http://localhost:${port} (dev=${dev})`);
     console.log(`[server] Twilio webhook: POST ${process.env.PUBLIC_URL || 'http://localhost:' + port}/twilio/voice`);
-    console.log(`[server] Twilio stream:  ws://localhost:${port}/twilio/stream\n`);
+    console.log(`[server] Twilio stream:  ws://localhost:${port}/twilio/stream`);
+    console.log(`[server] Debug logging: ${DEBUG ? 'ENABLED' : 'disabled (set DEBUG=true to enable)'}\n`);
   });
 });
-

@@ -22,7 +22,8 @@ import { createModerationGuardrail } from "@/app/agentConfigs/guardrails";
 
 // Agent configs
 import { allAgentSets, defaultAgentSetKey } from "@/app/agentConfigs";
-import { nikaCompanyName } from "@/app/agentConfigs/nika";
+import { nikaCompanyName, nikaPlaybackRateByAgentName } from "@/app/agentConfigs/nika";
+import { effiCompanyName, effiPlaybackRateByAgentName } from "@/app/agentConfigs/effi";
 
 // Map used by connect logic for scenarios defined via the SDK.
 const sdkScenarioMap: Record<string, RealtimeAgent[]> = allAgentSets;
@@ -164,6 +165,19 @@ function App() {
     }
   }, [selectedAgentConfigSet, selectedAgentName, sessionStatus]);
 
+  // Apply per-agent playback speed (client-side audio element).
+  // This is the "hard param" that makes voices faster/slower.
+  useEffect(() => {
+    if (!audioElementRef.current || sessionStatus !== 'CONNECTED') return;
+    const agentSetKey = searchParams.get("agentConfig") || defaultAgentSetKey;
+    const rateMap =
+      agentSetKey === 'effi'
+        ? effiPlaybackRateByAgentName
+        : nikaPlaybackRateByAgentName;
+    const rate = rateMap?.[selectedAgentName] ?? 1.0;
+    audioElementRef.current.playbackRate = rate;
+  }, [selectedAgentName, sessionStatus, searchParams]);
+
   useEffect(() => {
     if (sessionStatus === "CONNECTED") {
       updateSession();
@@ -204,7 +218,7 @@ function App() {
           reorderedAgents.unshift(agent);
         }
 
-        const companyName = nikaCompanyName;
+        const companyName = agentSetKey === 'effi' ? effiCompanyName : nikaCompanyName;
         const guardrail = createModerationGuardrail(companyName);
 
         await connect({

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node server.cjs",
+    "dev": "NODE_ENV=development node server.cjs",
     "dev:web": "next dev",
     "dev:twilio": "node server.cjs",
     "build": "next build",
