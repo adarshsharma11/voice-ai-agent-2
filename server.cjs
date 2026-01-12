@@ -892,13 +892,9 @@ app.prepare().then(() => {
     
     if (expected) {
       if (!token) {
-        // Token missing - this is a misconfiguration. Reject cleanly with cooldown.
-        console.warn(`[ws-auth] Rejected ${clientIp}: token missing (STREAM_SECRET is set)`);
-        trackRejection(clientIp);
-        socket.destroy();
-        return;
-      }
-      if (token !== expected) {
+        // Token missing - could be stripped by proxy. Allow connection, but validate in 'start' event.
+        debugLog(`[ws-auth] ${clientIp}: token missing in URL, deferring to start event`);
+      } else if (token !== expected) {
         // Token mismatch - reject with cooldown
         console.warn(`[ws-auth] Rejected ${clientIp}: token mismatch`);
         trackRejection(clientIp);
@@ -1023,12 +1019,19 @@ app.prepare().then(() => {
       
       if (audioAggregationBuffer.length === 0) return;
       
-      // Concatenate all base64 chunks into one
-      // Note: For G.711 μ-law, we can simply concatenate the raw samples
-      const combined = audioAggregationBuffer.join('');
-      audioAggregationBuffer = [];
-      
-      sendToTwilio(combined);
+      // Concatenate all base64 chunks correctly
+      // We must decode each chunk to a buffer, concatenate, then re-encode
+      try {
+        const buffers = audioAggregationBuffer.map(chunk => Buffer.from(chunk, 'base64'));
+        const combinedBuffer = Buffer.concat(buffers);
+        const combinedBase64 = combinedBuffer.toString('base64');
+        
+        audioAggregationBuffer = [];
+        sendToTwilio(combinedBase64);
+      } catch (e) {
+        console.error('[audio] Aggregation error', e);
+        audioAggregationBuffer = [];
+      }
     };
 
     const queueAudio = (payload) => {
@@ -1564,13 +1567,21 @@ app.prepare().then(() => {
       if (inboundAudioBuffer.length === 0) return;
       
       // Send aggregated audio to OpenAI
-      const combined = inboundAudioBuffer.join('');
-      inboundAudioBuffer = [];
-      
-      sendToOpenAI({
-        type: 'input_audio_buffer.append',
-        audio: combined,
-      });
+      try {
+        const buffers = inboundAudioBuffer.map(chunk => Buffer.from(chunk, 'base64'));
+        const combinedBuffer = Buffer.concat(buffers);
+        const combinedBase64 = combinedBuffer.toString('base64');
+        
+        inboundAudioBuffer = [];
+        
+        sendToOpenAI({
+          type: 'input_audio_buffer.append',
+          audio: combinedBase64,
+        });
+      } catch (e) {
+        console.error('[inbound-audio] Aggregation error', e);
+        inboundAudioBuffer = [];
+      }
     };
     
     const queueInboundAudio = (payload) => {
@@ -1617,11 +1628,14 @@ app.prepare().then(() => {
           const cp = msg.start?.customParameters || msg.start?.custom_parameters || {};
           if (cp.agent) agent = normalizeAgentKey(cp.agent);
           const expected = process.env.STREAM_SECRET;
-          if (expected && cp.token && cp.token !== expected) {
-            console.warn('[twilio] invalid stream token in start event (closing)');
-            if (ws._clientIp) trackRejection(ws._clientIp);
-            ws.close();
-            return;
+          if (expected) {
+            const token = cp.token;
+            if (!token || token !== expected) {
+              console.warn(`[twilio] invalid stream token in start event (closing): ${token ? 'mismatch' : 'missing'}`);
+              if (ws._clientIp) trackRejection(ws._clientIp);
+              ws.close();
+              return;
+            }
           }
         } catch {}
 
