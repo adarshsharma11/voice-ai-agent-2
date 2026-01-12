@@ -436,6 +436,92 @@ function App() {
 
   const agentSetKey = searchParams.get("agentConfig") || "default";
 
+  const [outboundNumbersText, setOutboundNumbersText] = useState<string>("");
+  const [outboundCampaignId, setOutboundCampaignId] = useState<string | null>(null);
+  const [outboundCampaign, setOutboundCampaign] = useState<any>(null);
+  const [outboundCampaignStatus, setOutboundCampaignStatus] = useState<
+    "idle" | "starting" | "running" | "stopping" | "error"
+  >("idle");
+  const [outboundError, setOutboundError] = useState<string | null>(null);
+
+  const startOutboundCampaign = async () => {
+    setOutboundError(null);
+    setOutboundCampaignStatus("starting");
+    try {
+      const numbers = outboundNumbersText
+        .split(/[\n,]/g)
+        .map((n) => n.trim())
+        .filter(Boolean);
+
+      const res = await fetch("/api/twilio/campaign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ numbers, agent: "outbound" }),
+      });
+
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setOutboundCampaignStatus("error");
+        setOutboundError(json?.error || "Failed to start campaign");
+        return;
+      }
+
+      setOutboundCampaignId(json?.campaign?.id || null);
+      setOutboundCampaign(json?.campaign || null);
+      setOutboundCampaignStatus("running");
+    } catch (e) {
+      setOutboundCampaignStatus("error");
+      setOutboundError(e instanceof Error ? e.message : "Failed to start campaign");
+    }
+  };
+
+  const stopOutboundCampaign = async () => {
+    if (!outboundCampaignId) return;
+    setOutboundError(null);
+    setOutboundCampaignStatus("stopping");
+    try {
+      const res = await fetch(`/api/twilio/campaign?campaignId=${encodeURIComponent(outboundCampaignId)}`, {
+        method: "DELETE",
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setOutboundCampaignStatus("error");
+        setOutboundError(json?.error || "Failed to stop campaign");
+        return;
+      }
+      setOutboundCampaign(json?.campaign || null);
+      setOutboundCampaignStatus("idle");
+      setOutboundCampaignId(null);
+    } catch (e) {
+      setOutboundCampaignStatus("error");
+      setOutboundError(e instanceof Error ? e.message : "Failed to stop campaign");
+    }
+  };
+
+  useEffect(() => {
+    if (!outboundCampaignId) return;
+    if (outboundCampaignStatus !== "running") return;
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(
+          `/api/twilio/campaign?campaignId=${encodeURIComponent(outboundCampaignId)}`,
+        );
+        const json = await res.json().catch(() => ({}));
+        if (res.ok) {
+          setOutboundCampaign(json?.campaign || null);
+          const status = json?.campaign?.status;
+          if (status === "completed" || status === "stopped" || status === "error") {
+            setOutboundCampaignStatus("idle");
+            setOutboundCampaignId(null);
+          }
+        }
+      } catch {}
+    }, 1500);
+
+    return () => clearInterval(interval);
+  }, [outboundCampaignId, outboundCampaignStatus]);
+
   return (
     <div className="text-base flex flex-col h-screen bg-gray-100 text-gray-800 relative">
       <div className="p-5 text-lg font-semibold flex justify-between items-center">
@@ -516,6 +602,50 @@ function App() {
               </div>
             </div>
           )}
+        </div>
+      </div>
+
+      <div className="px-5 pb-3">
+        <div className="bg-white border border-gray-200 rounded-lg p-3 flex items-start gap-3">
+          <div className="flex-1">
+            <div className="text-sm font-semibold">Outbound calls</div>
+            <div className="text-xs text-gray-600">
+              Paste numbers (one per line) and start calling sequentially.
+            </div>
+            <textarea
+              value={outboundNumbersText}
+              onChange={(e) => setOutboundNumbersText(e.target.value)}
+              placeholder={"+14155551234\n+13105551234"}
+              className="mt-2 w-full border border-gray-300 rounded-md px-2 py-1 text-sm font-normal focus:outline-none"
+              rows={3}
+            />
+            {outboundError ? (
+              <div className="mt-2 text-sm text-red-700">{outboundError}</div>
+            ) : null}
+            {outboundCampaign ? (
+              <div className="mt-2 text-xs text-gray-700">
+                {outboundCampaign.status} · {outboundCampaign.completed}/{outboundCampaign.total} ·{" "}
+                {outboundCampaign.currentTo ? `dialing ${outboundCampaign.currentTo}` : "idle"} ·{" "}
+                {outboundCampaign.lastCallStatus ? outboundCampaign.lastCallStatus : "no status"}
+              </div>
+            ) : null}
+          </div>
+          <div className="flex flex-col gap-2">
+            <button
+              onClick={startOutboundCampaign}
+              disabled={outboundCampaignStatus === "starting" || outboundCampaignStatus === "running"}
+              className="bg-black hover:bg-gray-900 text-white text-sm px-3 py-2 rounded-md disabled:opacity-50"
+            >
+              {outboundCampaignStatus === "starting" ? "Starting..." : "Start calls"}
+            </button>
+            <button
+              onClick={stopOutboundCampaign}
+              disabled={!outboundCampaignId || outboundCampaignStatus !== "running"}
+              className="bg-gray-200 hover:bg-gray-300 text-sm px-3 py-2 rounded-md disabled:opacity-50"
+            >
+              Stop
+            </button>
+          </div>
         </div>
       </div>
 
