@@ -1327,6 +1327,7 @@ app.prepare().then(() => {
               return { success: true, provider: 'mock' };
             }
 
+            
             // Real tools backed by Next API routes
             if (name === 'calendar_find_slots') {
               debugLog('[calendar_find_slots] ALL args:', JSON.stringify(toolArgs));
