@@ -109,6 +109,7 @@ async function dialNext(campaign: Campaign) {
     return;
   }
 
+  
   campaign.dialing = true;
   campaign.currentTo = next;
   campaign.lastError = null;

@@ -300,6 +300,7 @@ function App() {
 
     setUserText("");
   };
+  
 
   const handleTalkButtonDown = () => {
     if (sessionStatus !== 'CONNECTED') return;

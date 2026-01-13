@@ -17,6 +17,7 @@ type Campaign = {
   lastError: string | null;
 };
 
+
 const globalStore = globalThis as typeof globalThis & {
   __twilioCampaigns?: Map<string, Campaign>;
 };
