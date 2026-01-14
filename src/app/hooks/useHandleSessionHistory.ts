@@ -1,8 +1,8 @@
 "use client";
 
 import { useRef } from "react";
-import { useTranscript } from "@/app/contexts/TranscriptContext";
-import { useEvent } from "@/app/contexts/EventContext";
+import { useTranscript } from "../contexts/TranscriptContext";
+import { useEvent } from "../contexts/EventContext";
 
 export function useHandleSessionHistory() {
   const {

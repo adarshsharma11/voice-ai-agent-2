@@ -2,9 +2,9 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { TranscriptItem } from "@/app/types";
+import { TranscriptItem } from "../types";
 import Image from "next/image";
-import { useTranscript } from "@/app/contexts/TranscriptContext";
+import { useTranscript } from "../contexts/TranscriptContext";
 import { DownloadIcon, ClipboardCopyIcon } from "@radix-ui/react-icons";
 import { GuardrailChip } from "./GuardrailChip";
 

@@ -15,15 +15,15 @@ import { SessionStatus } from "@/app/types";
 import type { RealtimeAgent } from '@openai/agents/realtime';
 
 // Context providers & hooks
-import { useTranscript } from "@/app/contexts/TranscriptContext";
-import { useEvent } from "@/app/contexts/EventContext";
+import { useTranscript } from "./contexts/TranscriptContext";
+import { useEvent } from "./contexts/EventContext";
 import { useRealtimeSession } from "./hooks/useRealtimeSession";
-import { createModerationGuardrail } from "@/app/agentConfigs/guardrails";
+import { createModerationGuardrail } from "./agentConfigs/guardrails";
 
 // Agent configs
-import { allAgentSets, defaultAgentSetKey } from "@/app/agentConfigs";
-import { nikaCompanyName, nikaPlaybackRateByAgentName } from "@/app/agentConfigs/nika";
-import { effiCompanyName, effiPlaybackRateByAgentName } from "@/app/agentConfigs/effi";
+import { allAgentSets, defaultAgentSetKey } from "./agentConfigs";
+import { nikaCompanyName, nikaPlaybackRateByAgentName } from "./agentConfigs/nika";
+import { effiCompanyName, effiPlaybackRateByAgentName } from "./agentConfigs/effi";
 
 // Map used by connect logic for scenarios defined via the SDK.
 const sdkScenarioMap: Record<string, RealtimeAgent[]> = allAgentSets;

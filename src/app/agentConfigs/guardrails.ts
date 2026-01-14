@@ -1,5 +1,5 @@
 import { zodTextFormat } from 'openai/helpers/zod';
-import { GuardrailOutputZod, GuardrailOutput } from '@/app/types';
+import { GuardrailOutputZod, GuardrailOutput } from '../types';
 
 // Validator that calls the /api/responses endpoint to
 // validates the realtime output according to moderation policies. 
