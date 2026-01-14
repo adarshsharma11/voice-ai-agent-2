@@ -38,6 +38,7 @@ function sanitizeToolLog(body: ToolLogBody) {
 }
 
 declare global {
+  // eslint-disable-next-line no-var
   var __NIKA_TOOL_LOGS__: Map<string, ToolLogBody[]> | undefined;
 }
 
