@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { appendRequestLog } from '@/app/lib/requestLog';
+import { appendRequestLog } from '../../lib/requestLog';
 
 export const runtime = 'nodejs';
 
@@ -89,4 +89,3 @@ export async function POST(req: NextRequest) {
 
   return NextResponse.json({ ok: true });
 }
-

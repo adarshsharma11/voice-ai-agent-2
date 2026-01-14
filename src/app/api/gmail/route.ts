@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { google } from 'googleapis';
-import { appendRequestLog } from '@/app/lib/requestLog';
+import { appendRequestLog } from '../../lib/requestLog';
 
 export const runtime = 'nodejs';
 
@@ -233,4 +233,3 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
-
