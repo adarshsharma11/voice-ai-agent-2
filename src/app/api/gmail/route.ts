@@ -14,7 +14,6 @@ type GmailGetRequest = {
   action: 'get';
   message_id?: string;
   // Alias: some callers send `id` instead of `message_id`
-  // eslint-disable-next-line @typescript-eslint/naming-convention
   id?: string;
   format?: 'metadata' | 'full';
 };
